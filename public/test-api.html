@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    button {
+      padding: 10px 15px;
+      margin: 10px 0;
+      cursor: pointer;
+    }
+    pre {
+      background-color: #f5f5f5;
+      padding: 10px;
+      border-radius: 5px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>API Test</h1>
+  
+  <h2>Test API Index</h2>
+  <button onclick="testApiIndex()">Test API Index</button>
+  <pre id="indexResult">Results will appear here...</pre>
+  
+  <h2>Test Text-to-Speech API</h2>
+  <button onclick="testTextToSpeech()">Test Text-to-Speech</button>
+  <pre id="ttsResult">Results will appear here...</pre>
+  <div id="audioPlayer"></div>
+  
+  <script>
+    async function testApiIndex() {
+      const resultElement = document.getElementById('indexResult');
+      resultElement.textContent = 'Testing...';
+      
+      try {
+        const response = await fetch('/api');
+        const data = await response.json();
+        resultElement.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        resultElement.textContent = `Error: ${error.message}`;
+      }
+    }
+    
+    async function testTextToSpeech() {
+      const resultElement = document.getElementById('ttsResult');
+      const audioPlayerElement = document.getElementById('audioPlayer');
+      resultElement.textContent = 'Testing...';
+      audioPlayerElement.innerHTML = '';
+      
+      try {
+        const response = await fetch('/api/text-to-speech', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            text: 'This is a test of the text to speech API. If you can hear this, the API is working correctly.',
+            voice: 'alloy'
+          })
+        });
+        
+        const data = await response.json();
+        resultElement.textContent = 'Response received. Audio data length: ' + 
+          (data.audio ? data.audio.length : 'No audio data');
+        
+        if (data.audio) {
+          const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
+          audioPlayerElement.innerHTML = '<audio controls src="data:audio/mp3;base64,' + 
+            data.audio + '"></audio>';
+        }
+      } catch (error) {
+        resultElement.textContent = `Error: ${error.message}`;
+      }
+    }
+  </script>
+</body>
+</html> 
