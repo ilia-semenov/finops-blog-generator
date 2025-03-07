@@ -150,6 +150,7 @@ function BlogGenerator() {
   const [showHistory, setShowHistory] = useState(false);
   const [humanizing, setHumanizing] = useState(false);
   const [humanizeSuccess, setHumanizeSuccess] = useState(false);
+  const [showVercelWarning, setShowVercelWarning] = useState(true);
 
   const strings = getLanguageStrings(selectedLanguage === 'auto' ? 'en' : selectedLanguage);
 
@@ -163,6 +164,12 @@ function BlogGenerator() {
         console.error('Error parsing history from localStorage:', e);
         localStorage.removeItem('finopsHistory');
       }
+    }
+    
+    // Check if we should show the Vercel warning
+    const hideVercelWarning = localStorage.getItem('hideVercelWarning');
+    if (hideVercelWarning) {
+      setShowVercelWarning(false);
     }
   }, []);
 
@@ -301,15 +308,19 @@ tags:
           errorMessage += 'Rate limit exceeded: Too many requests. Please try again later.';
         } else if (err.response.status === 400) {
           errorMessage += `Bad request: ${err.response.data?.error || 'Please check your inputs and try again.'}`;
+        } else if (err.response.status === 504 || err.response.status === 503) {
+          errorMessage += 'Server timeout: The request took too long to process. This is likely due to Vercel\'s 5-second timeout limit on the free plan. Try using a shorter prompt, selecting a faster model, or reducing the content length.';
         } else {
           errorMessage += err.response.data?.error || err.response.statusText || err.message;
         }
       } else if (err.code === 'ECONNABORTED') {
-        errorMessage += 'Request timed out. The server took too long to respond.';
+        errorMessage += 'Request timed out. The server took too long to respond. This may be due to Vercel\'s timeout limits.';
       } else if (err.code === 'ECONNREFUSED') {
         errorMessage += 'Connection refused. The server may be down or unreachable.';
       } else if (err.message.includes('Network Error')) {
         errorMessage += 'Network error: Unable to connect to the API. Please check your internet connection.';
+      } else if (err.message.includes('timeout') || err.message.includes('Timeout') || err.message.includes('504')) {
+        errorMessage += 'Server timeout: The request took too long to process. This is likely due to Vercel\'s 5-second timeout limit on the free plan. Try using a shorter prompt, selecting a faster model, or reducing the content length.';
       } else {
         errorMessage += err.message || 'Unknown error';
       }
@@ -362,6 +373,16 @@ tags:
       });
     }
 
+    // Add a note about Vercel's timeout limits for deployed version
+    const isDeployed = window.location.hostname.includes('vercel.app');
+    if (isDeployed) {
+      messages.push({
+        role: 'system',
+        content: `IMPORTANT: This request is running on Vercel's free plan with a 5-second timeout limit. 
+        Respond quickly and concisely. Keep your response shorter than usual while still addressing the main points.`
+      });
+    }
+
     messages.push({
       role: 'user',
       content: selectedLanguage === 'auto' 
@@ -370,9 +391,20 @@ tags:
     });
 
     const modelToUse = selectedModel === 'default' ? 'gpt-4o' : selectedModel;
+    
+    // Adjust max tokens based on output length and deployment environment
+    let maxTokens;
+    if (isDeployed) {
+      // Use smaller token limits for deployed version to avoid timeouts
+      maxTokens = outputLength === 'short' ? 500 : outputLength === 'long' ? 1000 : 750;
+    } else {
+      // Use normal token limits for local development
+      maxTokens = outputLength === 'short' ? 1000 : outputLength === 'long' ? 4000 : 2000;
+    }
 
     try {
       console.log('Calling OpenAI API with model:', modelToUse);
+      console.log('Using max tokens:', maxTokens);
       
       // Use API endpoint
       const response = await axios.post(
@@ -381,9 +413,12 @@ tags:
           model: modelToUse,
           messages: messages,
           temperature: 0.7,
+          max_tokens: maxTokens,
+          // Add a flag to indicate this is running on Vercel
+          isVercel: isDeployed
         },
         {
-          timeout: 60000 // 60 second timeout
+          timeout: isDeployed ? 4500 : 60000 // 4.5 seconds for Vercel, 60 seconds for local
         }
       );
 
@@ -395,6 +430,26 @@ tags:
         
         // Add to history after setting the blog post
         addToHistory(formattedContent);
+        
+        // If this was a partial response (truncated due to Vercel limits), show a note
+        if (response.data.partial) {
+          setTimeout(() => {
+            setError(
+              <div>
+                <strong>Note:</strong> Due to Vercel's 5-second timeout limit, your content was truncated. 
+                <div className="error-suggestion">
+                  For complete content:
+                  <ul>
+                    <li>Try a shorter prompt</li>
+                    <li>Select a faster model (like GPT-3.5 or Claude Haiku)</li>
+                    <li>Choose "Short" for content length</li>
+                    <li>Run the application locally</li>
+                  </ul>
+                </div>
+              </div>
+            );
+          }, 1000);
+        }
       } else {
         throw new Error('Unexpected response format from OpenAI API');
       }
@@ -701,8 +756,27 @@ tags:
       
       setHistory(prevHistory => [historyItem, ...prevHistory.slice(0, 19)]);
       
-      // Show success message
+      // Show success message with note if it was partial humanization
       setHumanizeSuccess(true);
+      
+      // If the humanization was partial, show a note to the user
+      if (response.data.partial) {
+        setTimeout(() => {
+          setError(
+            <div>
+              <strong>Note:</strong> Due to Vercel's 5-second timeout limit on the free plan, only the first portion of your content was humanized. 
+              <div className="error-suggestion">
+                For full humanization, consider:
+                <ul>
+                  <li>Upgrading to a paid Vercel plan</li>
+                  <li>Running the application locally</li>
+                  <li>Humanizing smaller pieces of content at a time</li>
+                </ul>
+              </div>
+            </div>
+          );
+        }, 1000);
+      }
       
     } catch (err) {
       console.error('Error humanizing content:', err);
@@ -712,13 +786,54 @@ tags:
       if (err.response) {
         console.error('Response status:', err.response.status);
         console.error('Response data:', err.response.data);
-        errorMessage += err.response.data?.error || err.response.statusText || err.message;
+        
+        if (err.response.status === 504 || err.response.status === 503) {
+          errorMessage = (
+            <div>
+              <strong>Server Timeout Error</strong>
+              <p>The request took too long to process. This is due to Vercel's 5-second timeout limit on the free plan.</p>
+              <div className="error-suggestion">
+                Possible solutions:
+                <ul>
+                  <li>Try humanizing a shorter piece of content</li>
+                  <li>Upgrade to a paid Vercel plan</li>
+                  <li>Run the application locally instead</li>
+                </ul>
+              </div>
+            </div>
+          );
+        } else {
+          errorMessage += err.response.data?.error || err.response.statusText || err.message;
+        }
       } else if (err.code === 'ECONNABORTED') {
-        errorMessage += 'Request timed out. The server took too long to respond.';
+        errorMessage = (
+          <div>
+            <strong>Request Timeout</strong>
+            <p>The server took too long to respond. This may be due to Vercel's timeout limits.</p>
+            <div className="error-suggestion">
+              Try using a shorter piece of content or running the application locally.
+            </div>
+          </div>
+        );
       } else if (err.code === 'ECONNREFUSED') {
         errorMessage += 'Connection refused. The server may be down or unreachable.';
       } else if (err.message.includes('Network Error')) {
         errorMessage += 'Network error: Unable to connect to the API. Please check your internet connection.';
+      } else if (err.message.includes('timeout') || err.message.includes('Timeout') || err.message.includes('504')) {
+        errorMessage = (
+          <div>
+            <strong>Server Timeout Error</strong>
+            <p>The request took too long to process. This is due to Vercel's 5-second timeout limit on the free plan.</p>
+            <div className="error-suggestion">
+              Possible solutions:
+              <ul>
+                <li>Try humanizing a shorter piece of content</li>
+                <li>Upgrade to a paid Vercel plan</li>
+                <li>Run the application locally instead</li>
+              </ul>
+            </div>
+          </div>
+        );
       } else {
         errorMessage += err.message || 'Unknown error';
       }
@@ -786,6 +901,7 @@ tags:
             className={`podcast-button ${generatingAudio ? 'generating' : ''}`}
             onClick={() => generatePodcast(content)}
             disabled={generatingAudio}
+            title="Note: Podcast generation may time out on Vercel's free plan due to the 5-second limit"
           >
             {generatingAudio ? strings.generatingPodcast || 'Generating Podcast...' : strings.generatePodcast || 'Generate Podcast'}
           </button>
@@ -794,7 +910,7 @@ tags:
             className={`humanize-button ${humanizing ? 'humanizing' : ''} ${humanizeSuccess ? 'success' : ''}`}
             onClick={humanizeContent}
             disabled={humanizing}
-            title={strings.humanizeTooltip}
+            title={strings.humanizeTooltip + " (Note: May time out on Vercel's free plan due to the 5-second limit)"}
           >
             {humanizing 
               ? strings.humanizingContent 
@@ -888,8 +1004,37 @@ tags:
     textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
   };
 
+  const dismissVercelWarning = () => {
+    setShowVercelWarning(false);
+    localStorage.setItem('hideVercelWarning', 'true');
+  };
+
   return (
     <div className="blog-generator">
+      {showVercelWarning && (
+        <div className="vercel-warning">
+          <div className="warning-content">
+            <strong>Vercel Free Plan Limitations</strong>
+            <p>
+              This application is running on Vercel's free plan, which has a 5-second timeout limit for serverless functions.
+              Longer operations like generating blog posts, podcasts, or humanizing content may fail with timeout errors.
+            </p>
+            <div className="warning-suggestions">
+              For the best experience:
+              <ul>
+                <li>Use shorter prompts</li>
+                <li>Select faster models (like GPT-3.5 or Claude Haiku)</li>
+                <li>Choose "Short" for content length</li>
+                <li>Run the application locally for unlimited processing time</li>
+              </ul>
+            </div>
+          </div>
+          <button className="dismiss-warning" onClick={dismissVercelWarning}>
+            Got it
+          </button>
+        </div>
+      )}
+      
       <div className="input-section">
         <div className="controls">
           <LanguageSelector 

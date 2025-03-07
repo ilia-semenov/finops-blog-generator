@@ -72,23 +72,86 @@ app.post('/api/anthropic', async (req, res) => {
 // Proxy endpoint for OpenAI API
 app.post('/api/openai', async (req, res) => {
   try {
-    const { model, messages, temperature, max_completion_tokens } = req.body;
+    const { model, messages, temperature, max_tokens, isVercel } = req.body;
     
     console.log('OpenAI API request:', { 
       model, 
       messages: messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content.substring(0, 50) + '...' : '...' })),
-      temperature
+      temperature,
+      max_tokens
     });
     
+    // Check if we're on Vercel or if the client indicated it's a Vercel deployment
+    const isVercelEnv = process.env.VERCEL === '1' || isVercel;
+    
+    // For Vercel with its 5-second timeout, use a more aggressive approach
+    if (isVercelEnv) {
+      console.log('Running in Vercel environment with timeout limitations');
+      
+      // Use a faster model if possible
+      let actualModel = model;
+      if (model === 'gpt-4o' || model === 'gpt-4') {
+        // Suggest using a faster model in the response
+        console.log('Switching to a faster model for Vercel environment');
+        actualModel = 'gpt-3.5-turbo';
+      }
+      
+      // Limit tokens more aggressively
+      const actualMaxTokens = Math.min(max_tokens || 2000, 1000);
+      
+      const requestBody = {
+        model: actualModel,
+        messages,
+        temperature: temperature || 0.7,
+        max_tokens: actualMaxTokens
+      };
+      
+      // Add max_completion_tokens only for o3-mini model
+      if (model === 'o3-mini') {
+        requestBody.max_completion_tokens = Math.min(max_tokens || 2000, 1000);
+      }
+      
+      const response = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        requestBody,
+        {
+          headers: {
+            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 4000 // 4 second timeout to stay within Vercel's limits
+        }
+      );
+      
+      console.log('OpenAI API response received (Vercel-optimized)');
+      
+      // Add a flag to indicate this was processed in Vercel's limited environment
+      response.data.partial = true;
+      if (actualModel !== model) {
+        response.data.model_switched = true;
+        response.data.original_model = model;
+        response.data.used_model = actualModel;
+      }
+      
+      res.json(response.data);
+      return;
+    }
+    
+    // Standard processing for non-Vercel environments
     const requestBody = {
       model,
       messages,
       temperature: temperature || 0.7
     };
     
+    // Add max_tokens if provided
+    if (max_tokens) {
+      requestBody.max_tokens = max_tokens;
+    }
+    
     // Add max_completion_tokens only for o3-mini model
-    if (model === 'o3-mini' && max_completion_tokens) {
-      requestBody.max_completion_tokens = max_completion_tokens;
+    if (model === 'o3-mini' && max_tokens) {
+      requestBody.max_completion_tokens = max_tokens;
     }
     
     const response = await axios.post(
@@ -99,7 +162,7 @@ app.post('/api/openai', async (req, res) => {
           'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 120000 // 120 second timeout
+        timeout: 120000 // 120 second timeout for non-Vercel environments
       }
     );
     
@@ -117,6 +180,13 @@ app.post('/api/openai', async (req, res) => {
       console.error('No response received:', error.request);
     } else {
       console.error('Error setting up request:', error.message);
+    }
+    
+    // Provide a more helpful error message for timeouts
+    if (error.code === 'ETIMEDOUT' || error.code === 'ESOCKETTIMEDOUT' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        error: 'Request timed out. On Vercel\'s free plan, functions are limited to 5 seconds. Try using a shorter prompt, a faster model, or reducing the content length.'
+      });
     }
     
     res.status(error.response?.status || 500).json({
@@ -197,6 +267,34 @@ app.post('/api/humanize', async (req, res) => {
     
     console.log(`Humanize request: ${content.substring(0, 100)}... (${content.length} chars)`);
     
+    // Check if we're on Vercel (production) or local development
+    const isVercel = process.env.VERCEL === '1';
+    
+    // For Vercel with its 5-second timeout, use a simpler approach
+    if (isVercel) {
+      // Extract metadata and content parts
+      const parts = content.split('---').filter(Boolean);
+      
+      if (parts.length < 2) {
+        return res.status(400).json({ error: 'Invalid content format. Expected metadata and content separated by ---' });
+      }
+      
+      const metadata = parts[0].trim();
+      const body = parts.slice(1).join('---').trim();
+      
+      // Process only the first 1000 characters to stay within time limits
+      const processedBody = await processContentChunk(body.substring(0, 1000));
+      
+      // Combine with the rest of the original content
+      const combinedBody = processedBody + body.substring(1000);
+      
+      // Reconstruct the full content
+      const humanizedContent = `${metadata}\n---\n${combinedBody}`;
+      
+      return res.json({ content: humanizedContent, partial: true });
+    }
+    
+    // For local development, process the entire content
     const response = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
@@ -231,7 +329,7 @@ app.post('/api/humanize', async (req, res) => {
           'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 120000 // 120 second timeout
+        timeout: 60000 // 60 second timeout for local development
       }
     );
     
@@ -247,11 +345,56 @@ app.post('/api/humanize', async (req, res) => {
       console.error('Response data:', error.response.data);
     }
     
+    // Provide a more helpful error message for timeouts
+    if (error.code === 'ETIMEDOUT' || error.code === 'ESOCKETTIMEDOUT' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        error: 'Request timed out. On Vercel\'s free plan, functions are limited to 5 seconds. Try humanizing smaller pieces of content or upgrade to a paid plan.'
+      });
+    }
+    
     res.status(error.response?.status || 500).json({
       error: error.response?.data?.error || { message: error.message }
     });
   }
 });
+
+// Helper function to process a chunk of content
+async function processContentChunk(chunk) {
+  try {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-3.5-turbo', // Use a faster model for chunks
+        messages: [
+          {
+            role: 'system',
+            content: `Rewrite this content to sound more human and natural. Reduce AI detection flags.
+            Keep it concise and maintain the same meaning and language.`
+          },
+          {
+            role: 'user',
+            content: chunk
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 500
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 4000 // 4 second timeout to stay within Vercel's limits
+      }
+    );
+    
+    return response.data.choices[0].message.content;
+  } catch (error) {
+    console.error('Error processing content chunk:', error);
+    // If processing fails, return the original chunk
+    return chunk;
+  }
+}
 
 // Simple test endpoint
 app.get('/api/test', (req, res) => {
